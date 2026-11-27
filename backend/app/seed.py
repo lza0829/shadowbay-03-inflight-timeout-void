@@ -86,6 +86,10 @@ def 初始化库() -> None:
     c = 连接()
     c.executescript(建表)
     c.execute("DELETE FROM 空桩")
-    c.executemany("INSERT INTO 空桩(名, 状态) VALUES (?, ?)", [(s, "空桩") for s in STUBS])
+    物化 = {"在途超时作废": "已物化"}
+    c.executemany(
+        "INSERT INTO 空桩(名, 状态) VALUES (?, ?)",
+        [(s, 物化.get(s, "空桩")) for s in STUBS],
+    )
     c.commit()
     c.close()

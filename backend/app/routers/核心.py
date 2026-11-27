@@ -6,6 +6,13 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.db import 连接, 预置目录
+from app.modules.在途超时作废 import (
+    即时事务,
+    在途计数,
+    列表指令服务,
+    列表补投条服务,
+    重连补投服务,
+)
 from app.seed import 现在
 
 api = APIRouter()
@@ -30,14 +37,18 @@ def 健康():
 @api.get("/总览")
 def 总览():
     c = 连接()
+    # 在途数唯一同源谓词：COUNT(指令廊 WHERE 状态='在途')，与 /对账、指令廊页完全同源。
+    在途 = 在途计数(c)
     out = {
         "设备": c.execute("SELECT COUNT(*) n FROM 设备册").fetchone()["n"],
         "在线": c.execute("SELECT COUNT(*) n FROM 设备册 WHERE 在线='在线'").fetchone()["n"],
         "影子已齐": c.execute("SELECT COUNT(*) n FROM 影子台 WHERE 对齐态='已齐'").fetchone()["n"],
-        "在途指令": c.execute("SELECT COUNT(*) n FROM 指令廊 WHERE 状态='在途'").fetchone()["n"],
+        "在途指令": 在途,
+        "在途数": 在途,
         "积压补投": c.execute("SELECT COUNT(*) n FROM 补投条 WHERE 状态='积压'").fetchone()["n"],
         "凭证轮次": c.execute("SELECT COUNT(*) n FROM 凭证轮").fetchone()["n"],
         "空桩": c.execute("SELECT COUNT(*) n FROM 空桩").fetchone()["n"],
+        "在途同源": "指令廊.状态='在途'",
     }
     c.close()
     return out
@@ -160,10 +171,7 @@ def 写上报(body: 上报入):
 
 @api.get("/指令廊")
 def 列指令():
-    c = 连接()
-    rows = [行(r) for r in c.execute("SELECT * FROM 指令廊 ORDER BY 下发时 DESC LIMIT 100").fetchall()]
-    c.close()
-    return rows
+    return 列表指令服务()
 
 
 class 指令入(BaseModel):
@@ -203,21 +211,22 @@ def 下发指令(body: 指令入):
         return {"令号": 令号, "状态": "拒令", "说明": "凭证指纹与在册不符"}
 
     if 设备["在线"] == "离线":
-        c.execute(
-            "INSERT INTO 指令廊(令号,设备键,动作,载荷,状态,凭证指纹,下发时,说明) "
-            "VALUES(?,?,?,?,'在途',?,?,'离线积压')",
-            (令号, body.设备键, body.动作, json.dumps(body.载荷, ensure_ascii=False), 指纹, ts),
-        )
-        序 = c.execute(
-            "SELECT COALESCE(MAX(序),0)+1 n FROM 补投条 WHERE 设备键=? AND 状态='积压'",
-            (body.设备键,),
-        ).fetchone()["n"]
-        条号 = "Q-" + uuid.uuid4().hex[:10]
-        c.execute(
-            "INSERT INTO 补投条(条号,设备键,令号,序,状态,入条时) VALUES(?,?,?,?,'积压',?)",
-            (条号, body.设备键, 令号, 序, ts),
-        )
-        c.commit()
+        # 同票原子写入「在途令 + 积压条」，杜绝扫描夹在两条写入之间产生幽灵条。
+        with 即时事务() as t:
+            t.execute(
+                "INSERT INTO 指令廊(令号,设备键,动作,载荷,状态,凭证指纹,下发时,说明) "
+                "VALUES(?,?,?,?,'在途',?,?,'离线积压')",
+                (令号, body.设备键, body.动作, json.dumps(body.载荷, ensure_ascii=False), 指纹, ts),
+            )
+            序 = t.execute(
+                "SELECT COALESCE(MAX(序),0)+1 n FROM 补投条 WHERE 设备键=? AND 状态='积压'",
+                (body.设备键,),
+            ).fetchone()["n"]
+            条号 = "Q-" + uuid.uuid4().hex[:10]
+            t.execute(
+                "INSERT INTO 补投条(条号,设备键,令号,序,状态,入条时) VALUES(?,?,?,?,'积压',?)",
+                (条号, body.设备键, 令号, 序, ts),
+            )
         c.close()
         return {"令号": 令号, "状态": "在途", "说明": "离线积压", "条号": 条号}
 
@@ -233,10 +242,7 @@ def 下发指令(body: 指令入):
 
 @api.get("/补投条")
 def 列补投():
-    c = 连接()
-    rows = [行(r) for r in c.execute("SELECT * FROM 补投条 ORDER BY 设备键, 序").fetchall()]
-    c.close()
-    return rows
+    return 列表补投条服务()
 
 
 class 断线入(BaseModel):
@@ -259,30 +265,14 @@ def 断线(body: 断线入):
 @api.post("/设备册/重连补投")
 def 重连补投(body: 断线入):
     c = 连接()
-    设备 = c.execute("SELECT * FROM 设备册 WHERE 设备键=?", (body.设备键,)).fetchone()
-    if not 设备:
+    if not c.execute("SELECT 1 FROM 设备册 WHERE 设备键=?", (body.设备键,)).fetchone():
         c.close()
         raise HTTPException(400, "设备不在册")
-    ts = 现在()
-    c.execute("UPDATE 设备册 SET 在线='在线', 更新时=? WHERE 设备键=?", (ts, body.设备键))
-    条们 = c.execute(
-        "SELECT * FROM 补投条 WHERE 设备键=? AND 状态='积压' ORDER BY 序",
-        (body.设备键,),
-    ).fetchall()
-    完成 = []
-    for 条 in 条们:
-        c.execute(
-            "UPDATE 补投条 SET 状态='已补', 补投时=? WHERE 条号=?",
-            (ts, 条["条号"]),
-        )
-        c.execute(
-            "UPDATE 指令廊 SET 状态='送达', 闭环时=?, 说明='重连补投' WHERE 令号=? AND 状态='在途'",
-            (ts, 条["令号"]),
-        )
-        完成.append(条["令号"])
-    c.commit()
     c.close()
-    return {"ok": True, "补投数": len(完成), "令号": 完成}
+    try:
+        return 重连补投服务(body.设备键)
+    except KeyError as e:
+        raise HTTPException(400, str(e))
 
 
 @api.get("/凭证轮")
